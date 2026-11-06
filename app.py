@@ -6,7 +6,7 @@ import json
 import os
 import secrets
 import sqlite3
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
@@ -50,7 +50,9 @@ def validate(data):
     result['status'] = data.get('status', 'new')
     if result['status'] not in STATUSES: raise ValueError('المرحلة غير صالحة')
     if result['due_date']:
-        try: date.fromisoformat(result['due_date'])
+        try:
+            parsed = date.fromisoformat(result['due_date'])
+            if parsed.isoformat() != result['due_date'] or parsed == date.max: raise ValueError()
         except ValueError: raise ValueError('التاريخ غير صالح')
     return result
 
@@ -80,6 +82,43 @@ def csv_export(items):
         writer.writerow({k: "'" + v if isinstance(v, str) and v.lstrip().startswith(('=', '+', '-', '@', '\t', '\r')) else v for k, v in item.items()})
     return '\ufeff' + output.getvalue()
 
+def ical_escape(value):
+    """Escape untrusted text for RFC 5545 content lines."""
+    return value.replace('\\', '\\\\').replace(';', '\\;').replace(',', '\\,').replace('\r\n', '\n').replace('\r', '\n').replace('\n', '\\n')
+
+def ical_fold(line):
+    # Fold at 75 octets without splitting a UTF-8 character; continuation space counts.
+    parts, current, size = [], '', 0
+    for char in line:
+        length = len(char.encode('utf-8'))
+        if size + length > 75:
+            parts.append(current)
+            current, size = ' ', 1
+        current += char
+        size += length
+    parts.append(current)
+    return '\r\n'.join(parts)
+
+def calendar_export(items, now=None):
+    stamp = (now or datetime.now(timezone.utc)).strftime('%Y%m%dT%H%M%SZ')
+    lines = ['BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//AAMM//Follow-ups//AR', 'CALSCALE:GREGORIAN', 'METHOD:PUBLISH']
+    for item in items:
+        if item['status'] in ('won', 'lost') or not item['due_date']:
+            continue
+        try:
+            due = date.fromisoformat(item['due_date'])
+            end = due + timedelta(days=1)
+        except (ValueError, OverflowError):
+            continue  # Ignore malformed dates in databases created by older versions.
+        summary = item['next_action'] or 'متابعة العميل'
+        description = 'العميل: ' + item['name']
+        if item['company']: description += '\nالشركة: ' + item['company']
+        lines.extend(['BEGIN:VEVENT', f"UID:opportunity-{item['id']}@aamm.local", 'DTSTAMP:' + stamp,
+                      'DTSTART;VALUE=DATE:' + due.strftime('%Y%m%d'), 'DTEND;VALUE=DATE:' + end.strftime('%Y%m%d'),
+                      'SUMMARY:' + ical_escape(summary), 'DESCRIPTION:' + ical_escape(description), 'END:VEVENT'])
+    lines.append('END:VCALENDAR')
+    return '\r\n'.join(ical_fold(line) for line in lines) + '\r\n'
+
 class Handler(BaseHTTPRequestHandler):
     def authorized(self):
         password = os.environ.get('AAMM_PASSWORD')
@@ -106,6 +145,7 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path == '/api/opportunities': return self.send(200, json.dumps(rows(), ensure_ascii=False))
         if path == '/api/export': return self.send(200, csv_export(rows()), 'text/csv; charset=utf-8', {'Content-Disposition': 'attachment; filename="opportunities.csv"'})
+        if path == '/api/calendar': return self.send(200, calendar_export(rows()), 'text/calendar; charset=utf-8', {'Content-Disposition': 'attachment; filename="follow-ups.ics"'})
         files = {'/': ('index.html', 'text/html; charset=utf-8'), '/app.js': ('app.js', 'text/javascript; charset=utf-8'), '/style.css': ('style.css', 'text/css; charset=utf-8')}
         if path not in files: return self.send(404, 'Not found', 'text/plain')
         filename, mime = files[path]
